@@ -195,6 +195,7 @@ class Packager:
 
             if worksheet.constant_memory:
                 worksheet._opt_reopen()
+                worksheet._write_pending_table_data()
                 worksheet._write_single_row()
 
             worksheet._set_xml_writer(

@@ -1293,6 +1293,14 @@ the first 100 or 200 rows. This will produce a reasonably accurate autofit for
 the first visible page of data without incurring the performance penalty of
 autofitting thousands of non-visible rows.
 
+.. Note::
+
+   In ``'constant_memory'`` mode the cell widths are accumulated as the data
+   is written, so ``autofit()`` should be called after the data is written,
+   as in standard mode. However, any feature that affects the width
+   calculation, such as a worksheet or table autofilter, must be set before
+   the rows it applies to are written.
+
 
 worksheet.insert_image()
 ------------------------
@@ -2006,11 +2014,12 @@ worksheet.add_table()
    :type  options:     dict
 
    :raises OverlappingRange: if the range overlaps a previous merge or table range.
+   :raises RowAlreadyWrittenError: in ``constant_memory`` mode, if the first
+           row of the table range has already been written.
 
    :returns:  0: Success.
    :returns: -1: Row or column is out of worksheet bounds.
    :returns: -2: Incorrect parameter or option.
-   :returns: -3: Not supported in ``constant_memory`` mode.
 
 The ``add_table()`` method is used to group a range of cells into an Excel
 Table::
@@ -2031,8 +2040,10 @@ See also the examples in :ref:`ex_tables`.
 
 .. Note::
 
-   Tables aren't available in XlsxWriter when :func:`Workbook`
-   ``'constant_memory'`` mode is enabled.
+   In ``'constant_memory'`` mode ``add_table()`` must be called before any
+   data is written to the first row of the table range, since rows cannot be
+   updated once they are flushed. A ``RowAlreadyWrittenError`` exception is
+   raised if the table's first row has already been written.
 
 
 worksheet.add_sparkline()

@@ -19,8 +19,10 @@ in the Microsoft Office documentation.
 
 .. Note::
 
-   Tables aren't available in XlsxWriter when :func:`Workbook`
-   ``'constant_memory'`` mode is enabled.
+   In ``'constant_memory'`` mode ``add_table()`` must be called before any
+   data is written to the first row of the table range, since rows cannot be
+   updated once they are flushed. A ``RowAlreadyWrittenError`` exception is
+   raised if the table's first row has already been written.
 
 
 add_table()

@@ -41,7 +41,11 @@ from xlsxwriter.chart import Chart
 from xlsxwriter.color import Color
 from xlsxwriter.comments import CommentType
 from xlsxwriter.drawing import Drawing, DrawingInfo, DrawingTypes
-from xlsxwriter.exceptions import DuplicateTableName, OverlappingRange
+from xlsxwriter.exceptions import (
+    DuplicateTableName,
+    OverlappingRange,
+    RowAlreadyWrittenError,
+)
 from xlsxwriter.format import Format
 from xlsxwriter.image import Image
 from xlsxwriter.shape import Shape
@@ -425,6 +429,10 @@ class Worksheet(xmlwriter.XMLwriter):
         self.merge = []
         self.merged_cells = {}
         self.table_cells = {}
+        self.table_ranges = []
+        self.pending_table_totals = []
+        self.pending_table_formulas = []
+        self.autofit_col_widths = {}
         self.row_spans = {}
 
         self.has_vml = False
@@ -2175,11 +2183,6 @@ class Worksheet(xmlwriter.XMLwriter):
             Nothing.
 
         """
-        # pylint: disable=too-many-nested-blocks
-        if self.constant_memory:
-            warn("Autofit is not supported in constant_memory mode.")
-            return
-
         # No data written to the target sheet; nothing to autofit
         if self.dim_rowmax is None:
             return
@@ -2194,99 +2197,62 @@ class Worksheet(xmlwriter.XMLwriter):
 
         max_width = min(max_width, self.max_col_width)
 
-        # Create a reverse lookup for the share strings table so we can convert
-        # the string id back to the original string.
-        strings = sorted(
-            self.str_table.string_table, key=self.str_table.string_table.__getitem__
-        )
+        if self.constant_memory:
+            # In constant_memory mode the cell data isn't stored, so the
+            # pixel widths are accumulated row by row as the data is
+            # written. Start from those accumulated widths.
+            col_width_max = dict(self.autofit_col_widths)
 
-        for row_num in range(self.dim_rowmin, self.dim_rowmax + 1):
-            if not self.table.get(row_num):
-                continue
+            # Also account for any cells in the current row buffer that
+            # haven't been flushed to the temp file yet.
+            for row_num, row_cells in self.table.items():
+                if row_num < self.previous_row:
+                    continue
 
-            for col_num in range(self.dim_colmin, self.dim_colmax + 1):
-                if col_num in self.table[row_num]:
-                    cell = self.table[row_num][col_num]
-                    cell_type = cell.__class__.__name__
-                    length = 0
-
-                    if cell_type in ("String", "RichString"):
-                        # Handle strings and rich strings.
-                        #
-                        # For standard shared strings we do a reverse lookup
-                        # from the shared string id to the actual string. For
-                        # rich strings we use the unformatted string. We also
-                        # split multi-line strings and handle each part
-                        # separately.
-                        if cell_type == "String":
-                            string_id = cell.string
-                            string = strings[string_id]
-                        else:
-                            string = cell.raw_string
-
-                        if "\n" not in string:
-                            # Single line string.
-                            length = xl_pixel_width(string)
-                        else:
-                            # Handle multi-line strings.
-                            for segment in string.split("\n"):
-                                seg_length = xl_pixel_width(segment)
-                                length = max(length, seg_length)
-
-                    elif cell_type == "Number":
-                        # Handle numbers.
-                        #
-                        # We use a workaround/optimization for numbers since
-                        # digits all have a pixel width of 7. This gives a
-                        # slightly greater width for the decimal place and
-                        # minus sign but only by a few pixels and
-                        # over-estimation is okay.
-                        length = 7 * len(str(cell.number))
-
-                    elif cell_type == "Datetime":
-                        # Handle dates.
-                        #
-                        # The following uses the default width for mm/dd/yyyy
-                        # dates. It isn't feasible to parse the number format
-                        # to get the actual string width for all format types.
-                        length = self.default_date_width
-
-                    elif cell_type == "Boolean":
-                        # Handle boolean values.
-                        #
-                        # Use the Excel standard widths for TRUE and FALSE.
-                        if cell.boolean:
-                            length = 31
-                        else:
-                            length = 36
-
-                    elif cell_type in ("Formula", "ArrayFormula"):
-                        # Handle formulas.
-                        #
-                        # We only try to autofit a formula if it has a
-                        # non-zero value.
-                        if isinstance(cell.value, (float, int)):
-                            if cell.value > 0:
-                                length = 7 * len(str(cell.value))
-
-                        elif isinstance(cell.value, str):
-                            length = xl_pixel_width(cell.value)
-
-                        elif isinstance(cell.value, bool):
-                            if cell.value:
-                                length = 31
-                            else:
-                                length = 36
+                for col_num, cell in row_cells.items():
+                    length = self._get_autofit_cell_length(cell)
 
                     # If the cell is in an autofilter header we add an
                     # additional 16 pixels for the dropdown arrow.
                     if self.filter_cells.get((row_num, col_num)) and length > 0:
                         length += 16
 
-                    # Add the string length to the lookup table.
                     width_max = col_width_max.get(col_num, 0)
                     if length > width_max:
                         col_width_max[col_num] = length
+        else:
+            # Create a reverse lookup for the share strings table so we can
+            # convert the string id back to the original string.
+            strings = sorted(
+                self.str_table.string_table,
+                key=self.str_table.string_table.__getitem__,
+            )
+
+            for row_num in range(self.dim_rowmin, self.dim_rowmax + 1):
+                if not self.table.get(row_num):
+                    continue
+
+                for col_num in range(self.dim_colmin, self.dim_colmax + 1):
+                    if col_num in self.table[row_num]:
+                        cell = self.table[row_num][col_num]
+
+                        # For standard shared strings we do a reverse lookup
+                        # from the shared string id to the actual string.
+                        string = None
+                        if cell.__class__.__name__ == "String":
+                            string = strings[cell.string]
+
+                        length = self._get_autofit_cell_length(cell, string)
+
+                        # If the cell is in an autofilter header we add an
+                        # additional 16 pixels for the dropdown arrow.
+                        if self.filter_cells.get((row_num, col_num)) and length > 0:
+                            length += 16
+
+                        # Add the string length to the lookup table.
+                        width_max = col_width_max.get(col_num, 0)
+                        if length > width_max:
+                            col_width_max[col_num] = length
 
         # Apply the width to the column.
         for col_num, width in col_width_max.items():
@@ -2317,6 +2283,81 @@ class Worksheet(xmlwriter.XMLwriter):
                     width=width,
                     autofit=True,
                 )
+
+    def _get_autofit_cell_length(self, cell, string: Optional[str] = None) -> int:
+        # Get the pixel width of a cell's contents for the autofit()
+        # calculation. For "String" cells in standard mode the resolved
+        # shared string must be supplied via the "string" parameter. In
+        # constant_memory mode the cell stores the (inline) string directly.
+        cell_type = cell.__class__.__name__
+        length = 0
+
+        if cell_type in ("String", "RichString"):
+            # Handle strings and rich strings.
+            #
+            # For rich strings we use the unformatted string. We also split
+            # multi-line strings and handle each part separately.
+            if cell_type == "RichString":
+                string = cell.raw_string
+            elif string is None:
+                # An in-line string in constant_memory mode.
+                string = cell.string
+
+            if "\n" not in string:
+                # Single line string.
+                length = xl_pixel_width(string)
+            else:
+                # Handle multi-line strings.
+                for segment in string.split("\n"):
+                    seg_length = xl_pixel_width(segment)
+                    length = max(length, seg_length)
+
+        elif cell_type == "Number":
+            # Handle numbers.
+            #
+            # We use a workaround/optimization for numbers since
+            # digits all have a pixel width of 7. This gives a
+            # slightly greater width for the decimal place and
+            # minus sign but only by a few pixels and
+            # over-estimation is okay.
+            length = 7 * len(str(cell.number))
+
+        elif cell_type == "Datetime":
+            # Handle dates.
+            #
+            # The following uses the default width for mm/dd/yyyy
+            # dates. It isn't feasible to parse the number format
+            # to get the actual string width for all format types.
+            length = self.default_date_width
+
+        elif cell_type == "Boolean":
+            # Handle boolean values.
+            #
+            # Use the Excel standard widths for TRUE and FALSE.
+            if cell.boolean:
+                length = 31
+            else:
+                length = 36
+
+        elif cell_type in ("Formula", "ArrayFormula"):
+            # Handle formulas.
+            #
+            # We only try to autofit a formula if it has a
+            # non-zero value.
+            if isinstance(cell.value, (float, int)):
+                if cell.value > 0:
+                    length = 7 * len(str(cell.value))
+
+            elif isinstance(cell.value, str):
+                length = xl_pixel_width(cell.value)
+
+            elif isinstance(cell.value, bool):
+                if cell.value:
+                    length = 31
+                else:
+                    length = 36
+
+        return length
 
     def set_row(
         self,
@@ -2488,23 +2529,61 @@ class Worksheet(xmlwriter.XMLwriter):
         # Check if the merge range overlaps a previous merged or table range.
         # This is a critical file corruption error in Excel.
         cell_range = xl_range(first_row, first_col, last_row, last_col)
-        for row in range(first_row, last_row + 1):
-            for col in range(first_col, last_col + 1):
-                if self.merged_cells.get((row, col)):
-                    previous_range = self.merged_cells.get((row, col))
+
+        if self.constant_memory:
+            # In constant_memory mode the per-cell overlap maps aren't
+            # maintained since their memory usage grows with the range size.
+            # Check for overlaps using the stored merge/table ranges instead.
+            for m_first_row, m_first_col, m_last_row, m_last_col in self.merge:
+                if (
+                    last_row >= m_first_row
+                    and first_row <= m_last_row
+                    and last_col >= m_first_col
+                    and first_col <= m_last_col
+                ):
+                    previous_range = xl_range(
+                        m_first_row, m_first_col, m_last_row, m_last_col
+                    )
                     raise OverlappingRange(
                         f"Merge range '{cell_range}' overlaps previous merge "
                         f"range '{previous_range}'."
                     )
 
-                if self.table_cells.get((row, col)):
-                    previous_range = self.table_cells.get((row, col))
+            for (
+                t_first_row,
+                t_first_col,
+                t_last_row,
+                t_last_col,
+                t_range,
+            ) in self.table_ranges:
+                if (
+                    last_row >= t_first_row
+                    and first_row <= t_last_row
+                    and last_col >= t_first_col
+                    and first_col <= t_last_col
+                ):
                     raise OverlappingRange(
                         f"Merge range '{cell_range}' overlaps previous table "
-                        f"range '{previous_range}'."
+                        f"range '{t_range}'."
                     )
+        else:
+            for row in range(first_row, last_row + 1):
+                for col in range(first_col, last_col + 1):
+                    if self.merged_cells.get((row, col)):
+                        previous_range = self.merged_cells.get((row, col))
+                        raise OverlappingRange(
+                            f"Merge range '{cell_range}' overlaps previous merge "
+                            f"range '{previous_range}'."
+                        )
 
-                self.merged_cells[(row, col)] = cell_range
+                    if self.table_cells.get((row, col)):
+                        previous_range = self.table_cells.get((row, col))
+                        raise OverlappingRange(
+                            f"Merge range '{cell_range}' overlaps previous table "
+                            f"range '{previous_range}'."
+                        )
+
+                    self.merged_cells[(row, col)] = cell_range
 
         # Store the merge range.
         self.merge.append([first_row, first_col, last_row, last_col])
@@ -3464,7 +3543,7 @@ class Worksheet(xmlwriter.XMLwriter):
         last_row: int,
         last_col: int,
         options: Optional[Dict[str, Any]] = None,
-    ) -> Literal[0, -1, -2, -3]:
+    ) -> Literal[0, -1, -2]:
         """
         Add an Excel table to a worksheet.
 
@@ -3479,20 +3558,21 @@ class Worksheet(xmlwriter.XMLwriter):
             0:  Success.
             -1: Row or column is out of worksheet bounds.
             -2: Incorrect parameter or option.
-            -3: Not supported in constant_memory mode.
+
+        In 'constant_memory' mode the table must be added before any data is
+        written to its first row, since rows are flushed to a temp file as
+        the worksheet is written. A RowAlreadyWrittenError exception is
+        raised if the first row of the table has already been written.
         """
         table = {}
         col_formats = {}
+        total_row_data = []
 
         if options is None:
             options = {}
         else:
             # Copy the user defined options so they aren't modified.
             options = options.copy()
-
-        if self.constant_memory:
-            warn("add_table() isn't supported in 'constant_memory' mode")
-            return -3
 
         # Check that row and col are valid without storing the values.
         if self._check_dimensions(first_row, first_col, True, True):
@@ -3509,23 +3589,75 @@ class Worksheet(xmlwriter.XMLwriter):
         # Check if the table range overlaps a previous merged or table range.
         # This is a critical file corruption error in Excel.
         cell_range = xl_range(first_row, first_col, last_row, last_col)
-        for row in range(first_row, last_row + 1):
-            for col in range(first_col, last_col + 1):
-                if self.table_cells.get((row, col)):
-                    previous_range = self.table_cells.get((row, col))
+
+        if self.constant_memory:
+            # In constant_memory mode rows are written out sequentially and
+            # cannot be updated once they are flushed to the temp file. The
+            # table header row must not have been written already.
+            if first_row < self.previous_row:
+                raise RowAlreadyWrittenError(
+                    f"Table range '{cell_range}' starts in a row that has "
+                    "already been written in 'constant_memory' mode. Call "
+                    "add_table() before writing data to the table range."
+                )
+
+            # The per-cell overlap maps aren't maintained in constant_memory
+            # mode since their memory usage grows with the table size. Check
+            # for overlaps using the stored table/merge ranges instead.
+            for (
+                t_first_row,
+                t_first_col,
+                t_last_row,
+                t_last_col,
+                t_range,
+            ) in self.table_ranges:
+                if (
+                    last_row >= t_first_row
+                    and first_row <= t_last_row
+                    and last_col >= t_first_col
+                    and first_col <= t_last_col
+                ):
                     raise OverlappingRange(
                         f"Table range '{cell_range}' overlaps previous "
-                        f"table range '{previous_range}'."
+                        f"table range '{t_range}'."
                     )
 
-                if self.merged_cells.get((row, col)):
-                    previous_range = self.merged_cells.get((row, col))
+            for m_first_row, m_first_col, m_last_row, m_last_col in self.merge:
+                if (
+                    last_row >= m_first_row
+                    and first_row <= m_last_row
+                    and last_col >= m_first_col
+                    and first_col <= m_last_col
+                ):
+                    previous_range = xl_range(
+                        m_first_row, m_first_col, m_last_row, m_last_col
+                    )
                     raise OverlappingRange(
                         f"Table range '{cell_range}' overlaps previous "
                         f"merge range '{previous_range}'."
                     )
 
-                self.table_cells[(row, col)] = cell_range
+            self.table_ranges.append(
+                (first_row, first_col, last_row, last_col, cell_range)
+            )
+        else:
+            for row in range(first_row, last_row + 1):
+                for col in range(first_col, last_col + 1):
+                    if self.table_cells.get((row, col)):
+                        previous_range = self.table_cells.get((row, col))
+                        raise OverlappingRange(
+                            f"Table range '{cell_range}' overlaps previous "
+                            f"table range '{previous_range}'."
+                        )
+
+                    if self.merged_cells.get((row, col)):
+                        previous_range = self.merged_cells.get((row, col))
+                        raise OverlappingRange(
+                            f"Table range '{cell_range}' overlaps previous "
+                            f"merge range '{previous_range}'."
+                        )
+
+                    self.table_cells[(row, col)] = cell_range
 
         # Valid input parameters.
         valid_parameter = {
@@ -3746,16 +3878,40 @@ class Worksheet(xmlwriter.XMLwriter):
 
                         value = user_data.get("total_value", 0)
 
-                        self._write_formula(last_row, col_num, formula, xformat, value)
+                        if self.constant_memory:
+                            # Defer the total row write in constant_memory
+                            # mode, see below.
+                            total_row_data.append(
+                                ("formula", col_num, formula, xformat, value)
+                            )
+                        else:
+                            self._write_formula(
+                                last_row, col_num, formula, xformat, value
+                            )
 
                     elif user_data.get("total_string"):
                         # Total label only (not a function).
                         total_string = user_data["total_string"]
                         col_data["total_string"] = total_string
 
-                        self._write_string(
-                            last_row, col_num, total_string, user_data.get("format")
-                        )
+                        if self.constant_memory:
+                            # Defer the total row write in constant_memory
+                            # mode, see below.
+                            total_row_data.append(
+                                (
+                                    "string",
+                                    col_num,
+                                    total_string,
+                                    user_data.get("format"),
+                                )
+                            )
+                        else:
+                            self._write_string(
+                                last_row,
+                                col_num,
+                                total_string,
+                                user_data.get("format"),
+                            )
 
                     # Get the dxf format index.
                     if xformat is not None:
@@ -3776,6 +3932,42 @@ class Worksheet(xmlwriter.XMLwriter):
 
             col_id += 1
 
+        # Store the filter cell positions for use in the autofit calculation.
+        # This is done before any table data is written since, in
+        # constant_memory mode, the header row may be flushed by the data
+        # writes below.
+        if options["autofilter"]:
+            for col in range(first_col, last_col + 1):
+                # Check that the table autofilter doesn't overlap a worksheet filter.
+                if self.filter_cells.get((first_row, col)):
+                    filter_type, filter_range = self.filter_cells.get((first_row, col))
+                    if filter_type == "worksheet":
+                        raise OverlappingRange(
+                            f"Table autofilter range '{cell_range}' overlaps previous "
+                            f"Worksheet autofilter range '{filter_range}'."
+                        )
+
+                self.filter_cells[(first_row, col)] = ("table", cell_range)
+
+        if self.constant_memory and first_data_row <= last_data_row:
+            # In constant_memory mode the column formulas can't be written
+            # immediately since that would flush all the rows up to the end
+            # of the table and prevent the user from writing the table data
+            # row by row. Instead the formula columns are stored and the
+            # formula cells are written as each table row is flushed.
+            for col_id, col_num in enumerate(range(first_col, last_col + 1)):
+                column_data = table["columns"][col_id]
+                if column_data and column_data["formula"]:
+                    self.pending_table_formulas.append(
+                        (
+                            first_data_row,
+                            last_data_row,
+                            col_num,
+                            column_data["formula"],
+                            col_formats.get(col_id),
+                        )
+                    )
+
         # Write the cell data if supplied.
         if "data" in options:
             data = options["data"]
@@ -3790,33 +3982,46 @@ class Worksheet(xmlwriter.XMLwriter):
                         else:
                             self._write(row, col, token, None)
 
-        # Write any columns formulas after the user supplied table data to
-        # overwrite it if required.
-        for col_id, col_num in enumerate(range(first_col, last_col + 1)):
-            column_data = table["columns"][col_id]
-            if column_data and column_data["formula"]:
-                formula_format = col_formats.get(col_id)
-                formula = column_data["formula"]
+        if not self.constant_memory:
+            # Write any columns formulas after the user supplied table data
+            # to overwrite it if required. The formulas are written row by
+            # row, rather than column by column, so that the rows are
+            # written in ascending order. This is required in
+            # constant_memory mode, where the formulas are written lazily as
+            # each row is flushed (see above). It doesn't affect the file
+            # structure in standard mode.
+            for row in range(first_data_row, last_data_row + 1):
+                for col_id, col_num in enumerate(range(first_col, last_col + 1)):
+                    column_data = table["columns"][col_id]
+                    if column_data and column_data["formula"]:
+                        formula_format = col_formats.get(col_id)
+                        formula = column_data["formula"]
 
-                for row in range(first_data_row, last_data_row + 1):
-                    self._write_formula(row, col_num, formula, formula_format)
+                        self._write_formula(row, col_num, formula, formula_format)
 
         # Store the table data.
         self.tables.append(table)
 
-        # Store the filter cell positions for use in the autofit calculation.
-        if options["autofilter"]:
-            for col in range(first_col, last_col + 1):
-                # Check that the table autofilter doesn't overlap a worksheet filter.
-                if self.filter_cells.get((first_row, col)):
-                    filter_type, filter_range = self.filter_cells.get((first_row, col))
-                    if filter_type == "worksheet":
-                        raise OverlappingRange(
-                            f"Table autofilter range '{cell_range}' overlaps previous "
-                            f"Worksheet autofilter range '{filter_range}'."
-                        )
+        if self.constant_memory and total_row_data:
+            # In constant_memory mode the total row cells can't be written
+            # immediately since that would flush all the rows up to the end
+            # of the table and prevent the user from writing the table data
+            # row by row. Instead the total row cells are stored and written
+            # when the table's last row is about to be flushed, or when the
+            # worksheet is closed.
+            self.pending_table_totals.append((last_row, total_row_data))
 
-                self.filter_cells[(first_row, col)] = ("table", cell_range)
+            # Account for the deferred cells in the autofit calculation
+            # since they won't have been written when autofit() is called.
+            for kind, col_num, *args in total_row_data:
+                if kind == "formula":
+                    cell = CellFormulaTuple(args[0], args[1], args[2])
+                else:
+                    cell = CellStringTuple(args[0], args[1])
+
+                length = self._get_autofit_cell_length(cell)
+                if length > self.autofit_col_widths.get(col_num, 0):
+                    self.autofit_col_widths[col_num] = length
 
         return 0
 
@@ -6782,6 +6987,11 @@ class Worksheet(xmlwriter.XMLwriter):
         # one row of data is kept in memory at any one time. We don't
         # write span data in the optimized case since it is optional.
 
+        # Write out any deferred table formula/total cells that precede the
+        # current row so that they aren't skipped by the row flush.
+        if self.pending_table_formulas or self.pending_table_totals:
+            self._write_pending_table_data(current_row_num)
+
         # Set the new previous row as the current row.
         row_num = self.previous_row
         self.previous_row = current_row_num
@@ -6804,6 +7014,19 @@ class Worksheet(xmlwriter.XMLwriter):
                         col_ref = self.table[row_num][col_num]
                         self._write_cell(row_num, col_num, col_ref)
 
+                        # Store the pixel width of the cell for the autofit()
+                        # calculation since the cell data isn't stored in
+                        # constant_memory mode.
+                        length = self._get_autofit_cell_length(col_ref)
+
+                        # If the cell is in an autofilter header we add an
+                        # additional 16 pixels for the dropdown arrow.
+                        if self.filter_cells.get((row_num, col_num)) and length > 0:
+                            length += 16
+
+                        if length > self.autofit_col_widths.get(col_num, 0):
+                            self.autofit_col_widths[col_num] = length
+
                 self._xml_end_tag("row")
             else:
                 # Row attributes or comments only.
@@ -6811,6 +7034,82 @@ class Worksheet(xmlwriter.XMLwriter):
 
         # Reset table.
         self.table.clear()
+
+    def _write_pending_table_data(self, before_row=None) -> None:
+        # Write out any table formula column cells and total row cells that
+        # were deferred by add_table() in constant_memory mode. Only cells
+        # in rows that precede the "before_row" row are written, unless it
+        # is None, in which case all pending cells are written. This method
+        # is called before row flushes and before the final row flush when
+        # the worksheet is closed.
+        if self.pending_table_formulas:
+            # Write the formula cells for any formula column rows that are
+            # about to be flushed or skipped. The formulas are written row
+            # by row so that the rows are flushed in ascending order.
+            min_row = None
+            max_row = None
+
+            for first_row, last_row, _, _, _ in self.pending_table_formulas:
+                row_start = max(first_row, self.previous_row)
+                if before_row is not None:
+                    row_end = min(last_row, before_row - 1)
+                else:
+                    row_end = last_row
+
+                if row_start <= row_end:
+                    if min_row is None:
+                        min_row = row_start
+                        max_row = row_end
+                    else:
+                        min_row = min(min_row, row_start)
+                        max_row = max(max_row, row_end)
+
+            if min_row is not None:
+                for row in range(min_row, max_row + 1):
+                    for (
+                        first_row,
+                        last_row,
+                        col_num,
+                        formula,
+                        formula_format,
+                    ) in self.pending_table_formulas:
+                        if first_row <= row <= last_row:
+                            self._write_formula(row, col_num, formula, formula_format)
+
+            if before_row is not None:
+                # Drop any formula columns that have been fully written.
+                self.pending_table_formulas = [
+                    entry
+                    for entry in self.pending_table_formulas
+                    if entry[1] >= before_row
+                ]
+            else:
+                self.pending_table_formulas = []
+
+        if not self.pending_table_totals:
+            return
+
+        remaining = []
+        to_write = []
+
+        for entry in self.pending_table_totals:
+            if before_row is None or entry[0] < before_row:
+                to_write.append(entry)
+            else:
+                remaining.append(entry)
+
+        # Update the pending list before writing any cells, since the writes
+        # re-enter this method via _write_single_row().
+        self.pending_table_totals = remaining
+
+        for last_row, total_row_data in sorted(to_write, key=lambda x: x[0]):
+            for kind, col_num, *args in total_row_data:
+                if kind == "formula":
+                    formula, xformat, value = args
+                    self._write_formula(last_row, col_num, formula, xformat, value)
+                else:
+                    string, xformat = args
+                    self._write_string(last_row, col_num, string, xformat)
 
     def _calculate_spans(self) -> None:
         # Calculate the "spans" attribute of the <row> tag. This is an

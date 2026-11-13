@@ -40,6 +40,10 @@ class OverlappingRange(XlsxInputError):
     """Worksheet merge range or table overlaps previous range."""
 
 
+class RowAlreadyWrittenError(XlsxInputError):
+    """Worksheet row was already written in 'constant_memory' mode."""
+
+
 class UndefinedImageSize(XlsxFileError):
     """No size data found in image file."""
 

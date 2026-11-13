@@ -1,4 +1,12 @@
 
+Release 3.3.2 -
+
+* Added support for the worksheet :func:`add_table()` and :func:`autofit()`
+  methods in ``constant_memory`` mode. In this mode ``add_table()`` must be
+  called before any data is written to the first row of the table range,
+  otherwise a ``RowAlreadyWrittenError`` exception is raised.
+
+
 Release 3.3.1 - October 28 2026
 -------------------------------
 

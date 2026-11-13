@@ -41,8 +41,14 @@ most spreadsheet applications.
 
 The trade-off when using ``'constant_memory'`` mode is that you won't be able
 to take advantage of any new features that manipulate cell data after it is
-written. Currently the :func:`add_table()` method doesn't work in this mode
-and :func:`merge_range()` and :func:`set_row()` only work for the current row.
+written. The :func:`merge_range()` and :func:`set_row()` methods only work
+for the current row, and the :func:`add_table()` method must be called before
+any data is written to the first row of the table range, since rows cannot be
+updated once they are flushed. A ``RowAlreadyWrittenError`` exception is
+raised if the table's first row has already been written. Similarly,
+:func:`autofilter()` should be called before writing data past the filter
+header row, and :func:`autofit()` should be called after the data is written,
+as in standard mode.
 
 
 Performance Figures
